@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+jinja2
+python-multipart
+gitpython
+supabase
+aiofiles
+websockets
+python-dotenv
