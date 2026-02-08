@@ -1,158 +1,147 @@
 import os
 import tempfile
 import zipfile
-import shutil
 import asyncio
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
-
+from typing import Dict, List
 from fastapi import (
-    FastAPI, Request, HTTPException,
-    WebSocket, WebSocketDisconnect,
-    UploadFile, Form
+    FastAPI, Request, HTTPException, WebSocket,
+    WebSocketDisconnect, UploadFile, Form
 )
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-
 from supabase import create_client, Client
 from git import Repo, GitCommandError
 import git
 import aiofiles
 import logging
 
-# -------------------- APP INIT --------------------
+# ==============================
+# SAFE DIRECTORY BOOTSTRAP (FIX)
+# ==============================
+os.makedirs("static", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+os.makedirs("/tmp/sessions", exist_ok=True)
 
+# ==============================
+# APP INIT
+# ==============================
 app = FastAPI(title="Mobile-Optimized Web IDE", debug=True)
 
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# -------------------- LOGGING --------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("web-ide")
-
-# -------------------- SUPABASE --------------------
-
+# ==============================
+# SUPABASE (OPTIONAL)
+# ==============================
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-supabase: Optional[Client] = (
+supabase: Client | None = (
     create_client(SUPABASE_URL, SUPABASE_KEY)
     if SUPABASE_URL and SUPABASE_KEY else None
 )
 
-# -------------------- WEBSOCKET STATE --------------------
+# ==============================
+# LOGGING
+# ==============================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("webide")
 
+# ==============================
+# WEBSOCKET STATE
+# ==============================
 websocket_sessions: Dict[str, List[WebSocket]] = {}
 
-# -------------------- HELPERS --------------------
+# ==============================
+# HELPERS
+# ==============================
+def sanitize_path(path: str) -> str:
+    normalized = os.path.normpath(path)
+    if normalized.startswith("..") or "/.." in normalized:
+        raise ValueError("Directory traversal detected")
+    return normalized
 
-BASE_SESSION_DIR = Path("/tmp/sessions")
+def get_session_path(secret_key: str, project_name: str) -> str:
+    return f"/tmp/sessions/{secret_key}_{project_name}"
 
-def validate_secret(secret_key: str):
-    if not secret_key.isdigit() or len(secret_key) != 10:
-        raise HTTPException(status_code=400, detail="Invalid secret key")
-
-def get_session_path(secret_key: str, project_name: str) -> Path:
-    path = BASE_SESSION_DIR / f"{secret_key}_{project_name}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path.resolve()
-
-def safe_join(base: Path, target: str) -> Path:
-    resolved = (base / target).resolve()
-    if not resolved.is_relative_to(base):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    return resolved
-
-def safe_extract_zip(zip_path: Path, dest: Path):
-    with zipfile.ZipFile(zip_path) as z:
-        for member in z.namelist():
-            member_path = safe_join(dest, member)
-            if member.endswith("/"):
-                member_path.mkdir(parents=True, exist_ok=True)
-            else:
-                member_path.parent.mkdir(parents=True, exist_ok=True)
-                with z.open(member) as src, open(member_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-
-async def broadcast(session_id: str, message: str):
-    sockets = websocket_sessions.get(session_id, [])
-    dead = []
-    for ws in sockets:
+async def delete_old_projects():
+    if supabase:
         try:
-            await ws.send_text(message)
-        except WebSocketDisconnect:
-            dead.append(ws)
-    for ws in dead:
-        sockets.remove(ws)
+            supabase.rpc("delete_old_projects").execute()
+        except Exception as e:
+            logger.warning(f"Supabase cleanup skipped: {e}")
 
-# -------------------- ROUTES --------------------
-
+# ==============================
+# ROUTES
+# ==============================
 @app.get("/", response_class=HTMLResponse)
-async def landing(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request, "page": "login"})
+async def landing_page(request: Request):
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "page": "login"
+    })
 
 @app.post("/login")
 async def login(
     secret_key: str = Form(...),
     project_name: str = Form(...)
 ):
-    validate_secret(secret_key)
+    if not secret_key.isdigit() or len(secret_key) != 10:
+        raise HTTPException(400, "Secret key must be 10 digits")
 
-    if supabase:
-        asyncio.create_task(delete_old_projects())
+    await delete_old_projects()
 
     return {
         "success": True,
         "redirect": f"/dashboard?secret_key={secret_key}&project_name={project_name}"
     }
 
-@app.get("/dashboard")
+@app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
     secret_key = request.query_params.get("secret_key")
     project_name = request.query_params.get("project_name")
 
-    validate_secret(secret_key)
+    if not secret_key or not project_name:
+        raise HTTPException(400, "Missing parameters")
 
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "page": "dashboard",
-            "secret_key": secret_key,
-            "project_name": project_name
-        }
-    )
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "page": "dashboard",
+        "secret_key": secret_key,
+        "project_name": project_name
+    })
 
+# ==============================
+# ZIP UPLOAD
+# ==============================
 @app.post("/upload_zip")
 async def upload_zip(
     secret_key: str = Form(...),
     project_name: str = Form(...),
-    zip_file: UploadFile = None
+    zip_file: UploadFile = Form(...)
 ):
-    validate_secret(secret_key)
-    if not zip_file:
-        raise HTTPException(400, "ZIP missing")
-
     session_path = get_session_path(secret_key, project_name)
+    os.makedirs(session_path, exist_ok=True)
+
     temp_zip = Path(tempfile.gettempdir()) / zip_file.filename
 
     async with aiofiles.open(temp_zip, "wb") as f:
         await f.write(await zip_file.read())
 
     try:
-        safe_extract_zip(temp_zip, session_path)
+        with zipfile.ZipFile(temp_zip) as z:
+            z.extractall(session_path)
     finally:
         temp_zip.unlink(missing_ok=True)
 
     return {"success": True}
 
+# ==============================
+# GIT CLONE
+# ==============================
 @app.post("/clone_repo")
 async def clone_repo(
     secret_key: str = Form(...),
@@ -160,74 +149,100 @@ async def clone_repo(
     repo_url: str = Form(...),
     github_token: str = Form(None)
 ):
-    validate_secret(secret_key)
     session_path = get_session_path(secret_key, project_name)
-
-    if session_path.exists():
-        shutil.rmtree(session_path)
-    session_path.mkdir()
+    os.makedirs(session_path, exist_ok=True)
 
     if github_token and repo_url.startswith("https://"):
         repo_url = repo_url.replace("https://", f"https://{github_token}@")
 
     try:
         Repo.clone_from(repo_url, session_path, depth=1)
+        return {"success": True}
     except GitCommandError as e:
         raise HTTPException(500, str(e))
 
+# ==============================
+# FILE TREE
+# ==============================
+@app.get("/api/files")
+async def file_tree(secret_key: str, project_name: str):
+    base = get_session_path(secret_key, project_name)
+    if not os.path.exists(base):
+        raise HTTPException(404)
+
+    def walk(path):
+        node = {"name": os.path.basename(path), "children": []}
+        for p in os.listdir(path):
+            full = os.path.join(path, p)
+            if os.path.isdir(full):
+                node["children"].append(walk(full))
+            else:
+                node["children"].append({"name": p})
+        return node
+
+    return walk(base)
+
+# ==============================
+# FILE READ / WRITE
+# ==============================
+@app.get("/api/file")
+async def read_file(secret_key: str, project_name: str, path: str):
+    full = os.path.join(
+        get_session_path(secret_key, project_name),
+        sanitize_path(path)
+    )
+    async with aiofiles.open(full, "r", encoding="utf-8") as f:
+        return {"content": await f.read()}
+
+@app.post("/api/save")
+async def save_file(
+    secret_key: str = Form(...),
+    project_name: str = Form(...),
+    path: str = Form(...),
+    content: str = Form(...)
+):
+    full = os.path.join(
+        get_session_path(secret_key, project_name),
+        sanitize_path(path)
+    )
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    async with aiofiles.open(full, "w", encoding="utf-8") as f:
+        await f.write(content)
     return {"success": True}
 
+# ==============================
+# WEBSOCKET TERMINAL
+# ==============================
 @app.websocket("/ws/terminal")
-async def terminal_ws(websocket: WebSocket):
-    await websocket.accept()
-    params = websocket.query_params
-    session_id = f"{params.get('secret_key')}_{params.get('project_name')}"
-
-    websocket_sessions.setdefault(session_id, []).append(websocket)
-
+async def ws_terminal(ws: WebSocket):
+    await ws.accept()
     try:
         while True:
-            await websocket.receive_text()
+            await ws.receive_text()
     except WebSocketDisconnect:
-        websocket_sessions[session_id].remove(websocket)
+        pass
 
+# ==============================
+# GIT COMMIT / PUSH
+# ==============================
 @app.post("/api/git_commit")
 async def git_commit(
     secret_key: str = Form(...),
     project_name: str = Form(...),
-    commit_message: str = Form("Update from Web IDE"),
-    github_token: str = Form(None)
+    message: str = Form("update")
 ):
-    validate_secret(secret_key)
-    session_path = get_session_path(secret_key, project_name)
-    session_id = f"{secret_key}_{project_name}"
-
-    repo = Repo(session_path)
-
-    if not repo.is_dirty(untracked_files=True):
-        await broadcast(session_id, "No changes to commit")
-        return {"success": True}
+    repo_path = get_session_path(secret_key, project_name)
+    repo = Repo(repo_path)
 
     repo.git.add(A=True)
-    repo.index.commit(commit_message)
+    if repo.is_dirty(untracked_files=True):
+        repo.index.commit(message)
 
-    if github_token:
-        origin = repo.remote()
-        origin.push()
-
-    await broadcast(session_id, "Commit successful")
     return {"success": True}
 
-# -------------------- BACKGROUND --------------------
-
-async def delete_old_projects():
-    try:
-        supabase.rpc("delete_old_projects").execute()
-    except Exception as e:
-        logger.warning(f"Cleanup failed: {e}")
-
-# -------------------- RUN --------------------
-
+# ==============================
+# ENTRYPOINT
+# ==============================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
