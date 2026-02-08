@@ -1,4 +1,4 @@
-name: Temp Web IDE (5 min)
+name: Temp Web IDE (Full Logs + Debug)
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
 jobs:
   run-ide:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
 
     steps:
       - name: Checkout repository
@@ -16,25 +17,64 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (verbose)
         run: |
+          set -x
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+          pip install -r requirements.txt
 
-      - name: Start FastAPI server
+      - name: Start FastAPI server (log capture)
         run: |
-          echo "Starting FastAPI..."
-          nohup uvicorn main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
+          set -x
+          echo "Starting FastAPI server..."
+          nohup uvicorn main:app \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --log-level debug \
+            > server.log 2>&1 &
+
           sleep 15
-          echo "Checking server..."
-          curl http://127.0.0.1:8000 || (echo "Server not responding" && cat server.log && exit 1)
+
+          echo "Health check..."
+          curl -v http://127.0.0.1:8000 || (
+            echo "❌ Server failed"
+            cat server.log
+            exit 1
+          )
+
+      - name: Show server logs (initial)
+        run: |
+          echo "===== SERVER LOGS ====="
+          cat server.log || true
 
       - name: Download cloudflared
         run: |
+          set -x
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o cloudflared
           chmod +x cloudflared
 
-      - name: Expose app (5 minutes)
+      - name: Run Cloudflare Tunnel (logs enabled)
         run: |
-          timeout 300 ./cloudflared tunnel --url http://127.0.0.1:8000
+          set -x
+          timeout 300 ./cloudflared tunnel \
+            --loglevel debug \
+            --url http://127.0.0.1:8000 \
+            > cloudflared.log 2>&1 || true
+
+      - name: Dump all logs (always)
+        if: always()
+        run: |
+          echo "===== SERVER.LOG ====="
+          cat server.log || true
+          echo "===== CLOUDFLARED.LOG ====="
+          cat cloudflared.log || true
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-runtime-logs
+          path: |
+            server.log
+            cloudflared.log
